@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Hermes Mirror CLI — Sub-Agent Mirroring Deployment
+
+Usage:
+  hermes-mirror create <mirror-id> [--description=...] [--tags=...] [--profile=standard] [--include-memory]
+  hermes-mirror deploy <mirror-id> [--target=docker|vps] [--env-file=...] [--ssh-host=...] [--port=8000]
+  hermes-mirror list
+  hermes-mirror inspect <mirror-id>
+  hermes-mirror delete <mirror-id>
+  hermes-mirror help
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import os
+from pathlib import Path
+from typing import List, Optional
+
+# Add plugin to path
+sys.path.insert(0, str(Path.home() / ".hermes" / "plugins" / "hermes-mirror"))
+
+from mirror import (
+    Snapshot, Collector, Packager, Deployer, DeployError,
+    list_snapshots, inspect_snapshot, delete_snapshot, MIRROR_STORAGE
+)
+
+
+def print_json(data) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def cmd_create(args: List[str]) -> None:
+    """hermes-mirror create <mirror-id> [options]"""
+    if not args or args[0].startswith("--"):
+        print("❌ Usage: hermes-mirror create <mirror-id> [--description=...] [--tags=a,b,c] [--profile=standard]")
+        sys.exit(1)
+
+    mirror_id = args[0]
+    description = ""
+    tags: List[str] = []
+    profile = "standard"
+    include_memory = False
+
+    for arg in args[1:]:
+        if arg.startswith("--description="):
+            description = arg.split("=", 1)[1]
+        elif arg.startswith("--tags="):
+            tags = [t.strip() for t in arg.split("=", 1)[1].split(",")]
+        elif arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1]
+        elif arg == "--include-memory":
+            include_memory = True
+
+    print(f"\n🪞  Creating mirror snapshot: {mirror_id}")
+    print(f"📋  Profile: {profile}")
+    print(f"🧠  Skills: scanning...")
+    print(f"🔌  Plugins: scanning...")
+    print(f"🔒  Sanitizer: active ({profile} mode)")
+
+    collector = Collector(
+        mirror_id=mirror_id,
+        description=description,
+        tags=tags,
+        profile=profile,
+        include_memory=include_memory,
+        output_dir=str(MIRROR_STORAGE / mirror_id),
+    )
+
+    snapshot = collector.collect()
+    snapshot_path = collector.collect_to_file(snapshot)
+
+    # Show redaction summary
+    print(f"\n{collector.sanitizer.redaction_summary()}")
+
+    print(f"\n✅  Mirror snapshot created!")
+    print(f"   📄  {snapshot_path}")
+    print(f"   🧠  {len(snapshot.skills)} skills")
+    print(f"   🔌  {len(snapshot.plugins)} plugins")
+
+    # Optional: build docker artifact
+    print(f"\n➡️  Ready to deploy: hermes-mirror deploy {mirror_id}")
+
+
+def cmd_deploy(args: List[str]) -> None:
+    """hermes-mirror deploy <mirror-id> [options]"""
+    if not args or args[0].startswith("--"):
+        print("❌ Usage: hermes-mirror deploy <mirror-id> [--target=docker|vps] [--env-file=...] [--ssh-host=...]")
+        sys.exit(1)
+
+    mirror_id = args[0]
+    target = "docker"
+    env_file = None
+    ssh_host = ""
+    ssh_user = "root"
+    port = 8000
+
+    for arg in args[1:]:
+        if arg.startswith("--target="):
+            target = arg.split("=", 1)[1]
+        elif arg.startswith("--env-file="):
+            env_file = Path(arg.split("=", 1)[1])
+        elif arg.startswith("--ssh-host="):
+            ssh_host = arg.split("=", 1)[1]
+        elif arg.startswith("--ssh-user="):
+            ssh_user = arg.split("=", 1)[1]
+        elif arg.startswith("--port="):
+            port = int(arg.split("=", 1)[1])
+
+    # Load snapshot
+    snap_dir = MIRROR_STORAGE / mirror_id
+    snapshot_json = snap_dir / "snapshot.json"
+    if not snapshot_json.exists():
+        print(f"❌ Snapshot '{mirror_id}' not found. Create it first with 'hermes-mirror create {mirror_id}'")
+        sys.exit(1)
+
+    snapshot = Snapshot.from_json_file(str(snapshot_json))
+
+    print(f"\n🚀  Deploying mirror: {mirror_id}")
+    print(f"🎯  Target: {target}")
+
+    # Package
+    packager = Packager()
+
+    try:
+        if target == "docker":
+            # Build Docker context
+            build_ctx = packager.package_docker(snapshot)
+            print(f"📦  Docker build context: {build_ctx}")
+            print(f"🔨  Building image: {mirror_id}")
+
+            # Deploy
+            deployer = Deployer(env_file=env_file)
+            result = deployer.deploy_docker(build_ctx, snapshot)
+
+            if "container_id" in result:
+                print(f"\n✅  Container started!")
+                print(f"   🆔  {result['container_id']}")
+                print(f"   📡  Port: {result['port']}")
+                print(f"   🏷️   Image: {result.get('image_tag', mirror_id)}")
+                print(f"\n📋  Logs: docker logs -f {result['container_id']}")
+
+        elif target == "vps":
+            if not ssh_host:
+                print("❌ VPS deploy requires --ssh-host=<hostname>")
+                sys.exit(1)
+
+            tar_path = packager.package_tar(snapshot)
+            print(f"📦  Artifact: {tar_path}")
+
+            deployer = Deployer(env_file=env_file)
+            result = deployer.deploy_vps(tar_path, snapshot, ssh_host, ssh_user)
+            print(f"\n✅  Deployed to VPS!")
+            print(f"   🌐  {ssh_host}")
+
+        else:
+            print(f"❌ Unknown target: {target} (use 'docker' or 'vps')")
+            sys.exit(1)
+
+    except DeployError as e:
+        print(f"\n❌ Deployment failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        sys.exit(1)
+    finally:
+        packager.cleanup()
+
+
+def cmd_list() -> None:
+    """hermes-mirror list"""
+    snapshots = list_snapshots()
+    if not snapshots:
+        print("\n📭  No mirror snapshots found.")
+        print("   Create one: hermes-mirror create <mirror-id>")
+        return
+
+    print(f"\n📋  Mirror Snapshots ({len(snapshots)}):")
+    print(f"   {'ID':<25} {'Created':<20} {'Skills':<8} {'Plugins':<8} {'Artifacts':<10}")
+    print(f"   {'─'*25} {'─'*20} {'─'*8} {'─'*8} {'─'*10}")
+    for snap in snapshots:
+        if "error" in snap:
+            print(f"   ⚠️  {snap['mirror_id']:<25} {snap.get('error', 'ERROR')}")
+        else:
+            has_a = "✅" if snap.get("has_artifacts") else "—"
+            print(f"   {snap['mirror_id']:<25} {snap.get('created_at', '?'):<20} "
+                  f"{snap.get('skills', 0):<8} {snap.get('plugins', 0):<8} {has_a:<10}")
+
+
+def cmd_inspect(args: List[str]) -> None:
+    """hermes-mirror inspect <mirror-id>"""
+    if not args:
+        print("❌ Usage: hermes-mirror inspect <mirror-id>")
+        sys.exit(1)
+
+    mirror_id = args[0]
+    detail = inspect_snapshot(mirror_id)
+
+    if not detail:
+        print(f"❌ Snapshot '{mirror_id}' not found.")
+        sys.exit(1)
+
+    print(f"\n🔍  Mirror: {mirror_id}")
+    print_json(detail)
+
+
+def cmd_delete(args: List[str]) -> None:
+    """hermes-mirror delete <mirror-id>"""
+    if not args:
+        print("❌ Usage: hermes-mirror delete <mirror-id>")
+        sys.exit(1)
+
+    mirror_id = args[0]
+    if delete_snapshot(mirror_id):
+        print(f"🗑️  Deleted snapshot: {mirror_id}")
+    else:
+        print(f"❌ Snapshot '{mirror_id}' not found.")
+        sys.exit(1)
+
+
+def cmd_help() -> None:
+    print(__doc__)
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        cmd_help()
+        sys.exit(1)
+
+    command = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "create": cmd_create,
+        "deploy": cmd_deploy,
+        "list": cmd_list,
+        "ls": cmd_list,
+        "inspect": cmd_inspect,
+        "show": cmd_inspect,
+        "delete": cmd_delete,
+        "rm": cmd_delete,
+        "help": cmd_help,
+        "--help": cmd_help,
+        "-h": cmd_help,
+    }
+
+    handler = commands.get(command)
+    if handler:
+        handler(args)
+    else:
+        print(f"❌ Unknown command: {command}")
+        cmd_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+name: hermes-mirror
+description: "Sub-Agent Mirroring in One Click — Snapshot, sanitize, package, and deploy clones of your Hermes Agent to Docker or VPS"
+version: 1.0.0
+author: "Antonov Salvarrey (@asalvarrey)"
+license: MIT
+hermes_versions: ">=2.0.0"
+python_requires: ">=3.10"
+install_deps:
+  - pyyaml>=6.0
+  - docker>=6.0
+tags:
+  - mirror
+  - deployment
+  - docker
+  - vps
+  - cloning
+  - multi-agent
